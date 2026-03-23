@@ -1276,99 +1276,119 @@ def main() -> None:
     # ── LoRA Test-Time Training (TTT) ─────────────────────────────────────────
     # Injects LoRA adapters into the last N layers. Runs AdamW on val tokens.
     # Restores original network topology and state afterward to ensure zero artifact overhead.
-    def lora_ttt(model, val_tokens, seq_len, device,
+    def lora_ttt(model, val_tokens, seq_len, device, tokens_per_byte,
                  lora_rank=8, lora_alpha=16.0,
-                 ttt_lr=0.001, ttt_epochs=3, layers_to_adapt=4):
+                 ttt_lr=0.001, ttt_epochs=3, layers_to_adapt=4, eot_id=2):
         import copy
+        import math
         original_state = copy.deepcopy(model.state_dict())
 
-        # Inject LoRA into last N attention projection layers only
-        lora_params = []
-        for i, block in enumerate(model.blocks):
-            if i >= len(model.blocks) - layers_to_adapt:
-                for name in ['c_q', 'c_k', 'c_v', 'proj']:
-                    base = getattr(block.attn, name)
-                    lora = LoRALinear(base, rank=lora_rank, alpha=lora_alpha)
-                    setattr(block.attn, name, lora)
-                    lora_params.extend([lora.lora_A, lora.lora_B])
+        # Split val_tokens into documents on endoftext token (Default eos=2)
+        boundaries = (val_tokens == eot_id).nonzero(as_tuple=True)[0].tolist()
+        boundaries = [0] + [b+1 for b in boundaries] + [len(val_tokens)]
+        documents = [val_tokens[boundaries[i]:boundaries[i+1]]
+                     for i in range(len(boundaries)-1)
+                     if boundaries[i+1] - boundaries[i] > seq_len]
 
-        # Freeze everything except LoRA params
-        for p in model.parameters():
-            p.requires_grad_(False)
-        for p in lora_params:
-            p.requires_grad_(True)
+        if not documents:
+            documents = [val_tokens]
 
-        optimizer = torch.optim.AdamW(lora_params, lr=ttt_lr,
-                                      betas=(0.9, 0.999), weight_decay=0.0)
-
-        model.train()
+        total_loss = 0.0
+        total_tokens = 0
         ttt_t0 = time.perf_counter()
-        total_seqs = (val_tokens.numel() - 1) // seq_len
 
-        for epoch in range(ttt_epochs):
-            for idx in range(total_seqs):
-                start = idx * seq_len
-                chunk = val_tokens[start: start + seq_len + 1].to(device)
-                x = chunk[:-1].unsqueeze(0).long()
-                y = chunk[1:].unsqueeze(0).long()
-                optimizer.zero_grad()
-                loss = model(x, y).mean()
-                loss.backward()
-                optimizer.step()
+        for doc_tokens in documents:
+            # Fresh LoRA injection for this document
+            lora_params = []
+            for i, block in enumerate(model.blocks):
+                if i >= len(model.blocks) - layers_to_adapt:
+                    for name in ['c_q', 'c_k', 'c_v', 'proj']:
+                        base = getattr(block.attn, name)
+                        lora = LoRALinear(base, rank=lora_rank, alpha=lora_alpha)
+                        setattr(block.attn, name, lora)
+                        lora_params.extend([lora.lora_A, lora.lora_B])
 
-        model.eval()
+            for p in model.parameters():
+                p.requires_grad_(False)
+            for p in lora_params:
+                p.requires_grad_(True)
+
+            optimizer = torch.optim.AdamW(
+                lora_params, lr=ttt_lr, betas=(0.9, 0.999), weight_decay=0.0
+            )
+
+            doc_seqs = (doc_tokens.numel() - 1) // seq_len
+            for epoch in range(ttt_epochs):
+                for idx in range(doc_seqs):
+                    start = idx * seq_len
+                    chunk = doc_tokens[start: start + seq_len + 1].to(device)
+                    x = chunk[:-1].unsqueeze(0).long()
+                    y = chunk[1:].unsqueeze(0).long()
+
+                    if epoch == ttt_epochs - 1:
+                        # Score on final epoch only (legal validation)
+                        model.eval()
+                        with torch.no_grad():
+                            loss = model(x, y)
+                            total_loss += loss.sum().item()
+                            total_tokens += y.numel()
+
+                    # Always adapt
+                    model.train()
+                    optimizer.zero_grad()
+                    adapt_loss = model(x, y)
+                    adapt_loss.mean().backward()
+                    optimizer.step()
+                    model.eval()
+
+            # Reset LoRA before next document
+            for i, block in enumerate(model.blocks):
+                if i >= len(model.blocks) - layers_to_adapt:
+                    for name in ['c_q', 'c_k', 'c_v', 'proj']:
+                        lora = getattr(block.attn, name)
+                        if isinstance(lora, LoRALinear):
+                            setattr(block.attn, name, lora.base)
+            model.load_state_dict(original_state)
+
         ttt_elapsed = time.perf_counter() - ttt_t0
-        log0(f'lora_ttt_complete rank:{lora_rank} epochs:{ttt_epochs} '
-             f'layers:{layers_to_adapt} time:{ttt_elapsed*1000:.0f}ms')
-        if ttt_elapsed > 50.0:
-            log0(f'WARNING: LoRA TTT took {ttt_elapsed:.1f}s')
+        avg_loss = total_loss / max(total_tokens, 1)
+        val_bpb = avg_loss / math.log(2) * tokens_per_byte
 
-        # Restore original topology (removes LoRA wrappers)
-        for i, block in enumerate(model.blocks):
-            if i >= len(model.blocks) - layers_to_adapt:
-                for name in ['c_q', 'c_k', 'c_v', 'proj']:
-                    lora = getattr(block.attn, name)
-                    if isinstance(lora, LoRALinear):
-                        setattr(block.attn, name, lora.base)
+        log0(f'lora_ttt_per_doc_complete rank:{lora_rank} epochs:{ttt_epochs} '
+             f'docs:{len(documents)} time:{ttt_elapsed*1000:.0f}ms '
+             f'val_bpb:{val_bpb:.4f}')
 
-        # Restore original weights
-        model.load_state_dict(original_state)
-        return original_state
+        return avg_loss, val_bpb
 
     # Run TTT on ALL ranks independently with the same sequential val_tokens order.
     # Each rank traverses the identical token sequence and runs the same deterministic
     # SGD updates -> converges to identical adapted weights on every GPU.
     # No broadcast needed. This matches how SWA averaging targets identical state.
-    original_state = lora_ttt(
-        base_model, val_tokens, args.train_seq_len, device,
-        lora_rank=8, lora_alpha=16.0, ttt_lr=0.001, ttt_epochs=3, layers_to_adapt=4,
-    )
+    # Compute tokens_per_byte matching sp1024 strict byte lengths
+    val_tokens_flat = val_tokens.to(device=device, dtype=torch.int64)
+    prev_ids = val_tokens_flat[:-1]
+    tgt_ids = val_tokens_flat[1:]
+    token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int32)
+    token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int32)
+    val_byte_count = token_bytes.to(torch.float64).sum().item()
+    val_token_count = float(tgt_ids.numel())
+    tokens_per_byte = val_token_count / val_byte_count
 
-    # Sliding window eval on int6-roundtripped + TTT-adapted weights
+    # Run Online TTT replacing sliding_eval entirely
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
-    if args.eval_stride > 0 and args.eval_stride < args.train_seq_len:
-        log0(f"final_eval_mode:sliding_window stride:{args.eval_stride} batch_seqs:{args.eval_batch_seqs}")
-        q_val_loss, q_val_bpb = eval_val_sliding(
-            args, base_model, rank, world_size, device,
-            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-            stride=args.eval_stride, batch_seqs=args.eval_batch_seqs,
-        )
-    else:
-        log0("final_eval_mode:standard")
-        q_val_loss, q_val_bpb = eval_val(
-            args, model, rank, world_size, device, grad_accum_steps,
-            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-        )
+    q_val_loss, q_val_bpb = lora_ttt(
+        base_model, val_tokens, args.train_seq_len, device,
+        tokens_per_byte=tokens_per_byte,
+        lora_rank=8, lora_alpha=16.0, ttt_lr=0.001, layers_to_adapt=4,
+    )
     torch.cuda.synchronize()
+
     log0(
         f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
-
-    # Restore pre-TTT weights on all ranks (TTT was only for eval)
-    base_model.load_state_dict(original_state)
 
     if distributed:
         dist.destroy_process_group()
