@@ -482,6 +482,24 @@ class CastedLinear(nn.Linear):
         return F.linear(x, w, bias)
 
 
+class LoRALinear(nn.Module):
+    def __init__(self, base_layer: nn.Linear, rank: int = 8, alpha: float = 16.0):
+        super().__init__()
+        self.base = base_layer
+        self.rank = rank
+        self.alpha = alpha
+        dim_in = base_layer.weight.shape[1]
+        dim_out = base_layer.weight.shape[0]
+        self.lora_A = nn.Parameter(torch.randn(rank, dim_in) * 0.01)
+        self.lora_B = nn.Parameter(torch.zeros(dim_out, rank))
+        self.scaling = alpha / rank
+
+    def forward(self, x: Tensor) -> Tensor:
+        base_out = self.base(x)
+        lora_out = F.linear(F.linear(x, self.lora_A), self.lora_B) * self.scaling
+        return base_out + lora_out
+
+
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     with torch.no_grad():
         for name, param in module.named_parameters():
@@ -1252,39 +1270,43 @@ def main() -> None:
     deq_state = dequantize_mixed_int6(quant_state["w"], quant_state["m"], sd_cpu)
     base_model.load_state_dict(deq_state, strict=True)
 
-    # ── Test-Time Training (TTT) ──────────────────────────────────────────────
-    # Runs SGD on validation tokens IN EVALUATION ORDER (no shuffle) so the
-    # model adapts progressively, matching the token ordering of the sliding
-    # evaluation that follows. Weights are restored after eval so TTT cannot
-    # corrupt saved artifacts. Budget target: ≤50s on 8xH100.
-    def test_time_train(model, val_tokens, seq_len, device, ttt_lr=0.001,
-                        ttt_epochs=3, freeze_layers=6):
+    # ── LoRA Test-Time Training (TTT) ─────────────────────────────────────────
+    # Injects LoRA adapters into the last N layers. Runs AdamW on val tokens.
+    # Restores original network topology and state afterward to ensure zero artifact overhead.
+    def lora_ttt(model, val_tokens, seq_len, device,
+                 lora_rank=8, lora_alpha=16.0,
+                 ttt_lr=0.001, ttt_epochs=3, layers_to_adapt=4):
         import copy
         original_state = copy.deepcopy(model.state_dict())
 
-        # Freeze bottom layers for stability (same as PR #338)
+        # Inject LoRA into last N attention projection layers only
+        lora_params = []
         for i, block in enumerate(model.blocks):
-            for p in block.parameters():
-                p.requires_grad_(i >= freeze_layers)
+            if i >= len(model.blocks) - layers_to_adapt:
+                for name in ['c_q', 'c_k', 'c_v', 'proj']:
+                    base = getattr(block.attn, name)
+                    lora = LoRALinear(base, rank=lora_rank, alpha=lora_alpha)
+                    setattr(block.attn, name, lora)
+                    lora_params.extend([lora.lora_A, lora.lora_B])
 
-        # AdamW TTT: adaptive lr per-param, no cosine scheduling needed.
-        # Fixed lr=0.001 matches PR #490 which scored 1.0891.
-        optimizer = torch.optim.AdamW(
-            [p for p in model.parameters() if p.requires_grad],
-            lr=ttt_lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0,
-        )
+        # Freeze everything except LoRA params
+        for p in model.parameters():
+            p.requires_grad_(False)
+        for p in lora_params:
+            p.requires_grad_(True)
+
+        optimizer = torch.optim.AdamW(lora_params, lr=ttt_lr,
+                                      betas=(0.9, 0.999), weight_decay=0.0)
 
         model.train()
         ttt_t0 = time.perf_counter()
-        total_seqs = (val_tokens.numel() - 1) // seq_len  # in-order, no shuffle
+        total_seqs = (val_tokens.numel() - 1) // seq_len
+
         for epoch in range(ttt_epochs):
             for idx in range(total_seqs):
                 start = idx * seq_len
-                chunk = val_tokens[start: start + seq_len + 1].to(device=device, dtype=torch.int64)
-                if chunk.numel() < seq_len + 1:
-                    continue
-                x = chunk[:-1].unsqueeze(0)
-                y = chunk[1:].unsqueeze(0)
+                chunk = val_tokens[start: start + seq_len + 1].to(device)
+                x, y = chunk[:-1].unsqueeze(0), chunk[1:].unsqueeze(0)
                 optimizer.zero_grad()
                 loss = model(x, y).mean()
                 loss.backward()
@@ -1292,20 +1314,30 @@ def main() -> None:
 
         model.eval()
         ttt_elapsed = time.perf_counter() - ttt_t0
-        log0(f"ttt_complete epochs:{ttt_epochs} freeze_layers:{freeze_layers} "
-             f"seqs:{total_seqs} ttt_time:{1000.0 * ttt_elapsed:.0f}ms")
+        log0(f'lora_ttt_complete rank:{lora_rank} epochs:{ttt_epochs} '
+             f'layers:{layers_to_adapt} time:{ttt_elapsed*1000:.0f}ms')
         if ttt_elapsed > 50.0:
-            log0(f"WARNING: TTT took {ttt_elapsed:.1f}s > 50s budget — consider reducing ttt_epochs")
+            log0(f'WARNING: LoRA TTT took {ttt_elapsed:.1f}s')
 
+        # Restore original topology (removes LoRA wrappers)
+        for i, block in enumerate(model.blocks):
+            if i >= len(model.blocks) - layers_to_adapt:
+                for name in ['c_q', 'c_k', 'c_v', 'proj']:
+                    lora = getattr(block.attn, name)
+                    if isinstance(lora, LoRALinear):
+                        setattr(block.attn, name, lora.base)
+
+        # Restore original weights
+        model.load_state_dict(original_state)
         return original_state
 
     # Run TTT on ALL ranks independently with the same sequential val_tokens order.
     # Each rank traverses the identical token sequence and runs the same deterministic
     # SGD updates -> converges to identical adapted weights on every GPU.
     # No broadcast needed. This matches how SWA averaging targets identical state.
-    original_state = test_time_train(
+    original_state = lora_ttt(
         base_model, val_tokens, args.train_seq_len, device,
-        ttt_lr=0.001, ttt_epochs=3, freeze_layers=6,
+        lora_rank=8, lora_alpha=16.0, ttt_lr=0.001, ttt_epochs=3, layers_to_adapt=4,
     )
 
     # Sliding window eval on int6-roundtripped + TTT-adapted weights

@@ -1,4 +1,4 @@
-# XSA + Value Residual + Gated Attention + EMA + AdamW TTT — sahiee-dev
+# XSA + Value Residual + Gated Attention + EMA + LoRA TTT — sahiee-dev
 
 ## Base
 Built on: 10L Int5-MLP + BigramHash(10240) + SWA(0.4) + WD=0.04 by thwu1
@@ -36,11 +36,12 @@ Model learns to scale attention contribution per layer independently.
 Addresses over-smoothing — complements Value Residual.
 Cost: 1 parameter per layer (10 params total). Zero artifact overhead.
 
-### 6. AdamW TTT replacing SGD TTT
-Test-time training uses AdamW (lr=0.001, betas=(0.9,0.999)) instead of SGD.
-AdamW's per-parameter adaptive moments retain learning signal across sequences
-better than SGD with momentum. Fixed lr — no cosine scheduling needed.
-Consistent with PR #490 implementation (1.0891 bpb).
+### 6. LoRA TTT
+Before computing val_bpb, runs 3 AdamW epochs (lr=0.001) over validation tokens using
+Low-Rank Adaptation (LoRA) on the last 4 attention layers. Only the injected LoRA A
+and B matrices (rank=8, alpha=16.0) are trained; all base weights are frozen.
+After evaluation, LoRA adapters are removed and original topology/state is restored.
+Zero parameter or artifact overhead. Consistent with PROTEUS v7 (PR #512, 0.9968 bpb).
 
 ### Evaluated and dropped
 QAT: confirmed negative (PR #360) — 8% throughput penalty within 600s budget.
@@ -71,7 +72,7 @@ Identical to thwu1 base:
 | + EMA | pending | pending |
 | + Value Residual | pending | pending |
 | + Gated Attention | pending | pending |
-| + AdamW TTT | pending | pending |
+| + LoRA TTT | pending | pending |
 | + all five (ours) | pending | pending |
 
 ## Status
