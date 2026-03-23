@@ -86,7 +86,7 @@ class Hyperparameters:
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
 
-    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 4096))
+    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 10240))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
 
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
@@ -675,14 +675,6 @@ class GPT(nn.Module):
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         
-        # TrigramHash: maps (prev_prev, prev, curr) token triplets to embeddings
-        self.trigram_vocab = 20480
-        self.trigram_dim   = 32
-        self.trigram_table = nn.Embedding(self.trigram_vocab, self.trigram_dim)
-        self.trigram_proj  = nn.Linear(self.trigram_dim, model_dim, bias=False)
-        nn.init.normal_(self.trigram_table.weight, std=0.02)
-        nn.init.normal_(self.trigram_proj.weight, std=0.001)
-        
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -723,13 +715,6 @@ class GPT(nn.Module):
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
             
-        tok = input_ids
-        prev_tok = torch.cat([torch.zeros_like(tok[:, :1]), tok[:, :-1]], dim=1)
-        prev_prev_tok = torch.roll(prev_tok, 1, dims=1)
-        prev_prev_tok[:, 0] = tok[:, 0]  # boundary: no context
-        trigram_idx = (prev_prev_tok.long() * 961 + prev_tok.long() * 31 + tok.long()) % self.trigram_vocab
-        x = x + self.trigram_proj(self.trigram_table(trigram_idx))
-        
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x0 = x
@@ -756,13 +741,6 @@ class GPT(nn.Module):
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
-            
-        tok = input_ids
-        prev_tok = torch.cat([torch.zeros_like(tok[:, :1]), tok[:, :-1]], dim=1)
-        prev_prev_tok = torch.roll(prev_tok, 1, dims=1)
-        prev_prev_tok[:, 0] = tok[:, 0]  # boundary: no context
-        trigram_idx = (prev_prev_tok.long() * 961 + prev_tok.long() * 31 + tok.long()) % self.trigram_vocab
-        x = x + self.trigram_proj(self.trigram_table(trigram_idx))
         
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
