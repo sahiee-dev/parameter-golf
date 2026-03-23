@@ -586,14 +586,15 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, dim: int, mlp_mult: float):
         super().__init__()
-        hidden = int(mlp_mult * dim)
-        self.fc = CastedLinear(dim, hidden, bias=False)
-        self.proj = CastedLinear(hidden, dim, bias=False)
-        self.proj._zero_init = True
-
+        # SwiGLU: 2/3 scaling keeps param count equal to 2x ReLU² MLP
+        hidden = int(mlp_mult * dim * 2 / 3)
+        self.gate = CastedLinear(dim, hidden, bias=False)
+        self.up   = CastedLinear(dim, hidden, bias=False)
+        self.down = CastedLinear(hidden, dim, bias=False)
+        self.down._zero_init = True
+        
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
-        return self.proj(x.square())
+        return self.down(F.silu(self.gate(x)) * self.up(x))
 
 
 class SmearGate(nn.Module):

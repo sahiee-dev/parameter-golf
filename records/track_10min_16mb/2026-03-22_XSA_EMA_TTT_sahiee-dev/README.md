@@ -50,8 +50,8 @@ bigram=4096+trigram=20480 by 0.35 val_loss at 1000 steps (T4 ablation, seed=42).
 
 ## Architecture
 Identical to thwu1 base:
-- 10 layers, 512 dim, 8 heads, 4 KV heads (GQA), ReLU²
-- MLP 3x expansion, SmearGate, BigramHash(10240)
+- 10 layers, 512 dim, 8 heads, 4 KV heads (GQA)
+- SwiGLU MLP (2/3 scaling, iso-param to 3x ReLU²), SmearGate, BigramHash(10240)
 - OrthoInit, U-Net skips, Muon WD=0.04, SWA start_frac=0.4
 - Sliding window eval stride=64, zstd-22, ~15.64MB artifact
 
