@@ -486,18 +486,20 @@ class LoRALinear(nn.Module):
     def __init__(self, base_layer: nn.Linear, rank: int = 8, alpha: float = 16.0):
         super().__init__()
         self.base = base_layer
-        self.rank = rank
-        self.alpha = alpha
+        self.scaling = alpha / rank
         dim_in = base_layer.weight.shape[1]
         dim_out = base_layer.weight.shape[0]
         device = base_layer.weight.device
+        # Initialize in float32, cast to input dtype at runtime like CastedLinear
         self.lora_A = nn.Parameter(torch.randn(rank, dim_in, device=device) * 0.01)
         self.lora_B = nn.Parameter(torch.zeros(dim_out, rank, device=device))
-        self.scaling = alpha / rank
 
     def forward(self, x: Tensor) -> Tensor:
+        # Cast LoRA params to input dtype, exactly like CastedLinear does
+        lora_A = self.lora_A.to(x.dtype)
+        lora_B = self.lora_B.to(x.dtype)
         base_out = self.base(x)
-        lora_out = F.linear(F.linear(x, self.lora_A), self.lora_B) * self.scaling
+        lora_out = F.linear(F.linear(x, lora_A), lora_B) * self.scaling
         return base_out + lora_out
 
 
