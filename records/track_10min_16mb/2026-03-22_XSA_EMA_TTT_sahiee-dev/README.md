@@ -1,4 +1,4 @@
-# XSA + EMA + TTT on thwu1 SOTA — sahiee-dev
+# XSA + Value Residual + Gated Attention + EMA + AdamW TTT — sahiee-dev
 
 ## Base
 Built on: 10L Int5-MLP + BigramHash(10240) + SWA(0.4) + WD=0.04 by thwu1
@@ -24,12 +24,23 @@ EMA coexists with SWA: SWA averages warmdown checkpoints, EMA tracks
 the full training trajectory. Zero artifact cost — EMA weights not stored.
 Consistent with technique in PR #338 (current best open PR, 1.1254 bpb).
 
-### 4. TTT — Test-Time Training
-Before computing val_bpb, runs 3 SGD epochs (lr=0.002, momentum=0.9)
-over validation tokens in evaluation order with bottom 6 layers frozen.
-Runs identically on all 8 ranks — deterministic in-order SGD on identical
-data produces identical weights without broadcast needed.
-Original weights restored after evaluation. Budget: ~47 seconds.
+### 4. Value Residual (all layers)
+Each Block adds a learned scalar (lambda_v, init=0) times the raw token embedding (v0)
+to its output. v0 is captured before SmearGate/RMSNorm and threaded through all blocks.
+Zero-init means no-op at step 0; model learns whether and how much direct input access
+helps per layer. Source: PR #487, #490 (confirmed ~-0.015 bpb on frontier PRs).
+
+### 5. Gated Attention
+Learned per-layer scalar gate on attention output. init=1 means no-op at step 0.
+Model learns to scale attention contribution per layer independently.
+Addresses over-smoothing — complements Value Residual.
+Cost: 1 parameter per layer (10 params total). Zero artifact overhead.
+
+### 6. AdamW TTT replacing SGD TTT
+Test-time training uses AdamW (lr=0.001, betas=(0.9,0.999)) instead of SGD.
+AdamW's per-parameter adaptive moments retain learning signal across sequences
+better than SGD with momentum. Fixed lr — no cosine scheduling needed.
+Consistent with PR #490 implementation (1.0891 bpb).
 
 ### Evaluated and dropped
 QAT: confirmed negative (PR #360) — 8% throughput penalty within 600s budget.
@@ -58,8 +69,10 @@ Identical to thwu1 base:
 | thwu1 base | 1.1428 | — |
 | + XSA | pending | pending |
 | + EMA | pending | pending |
-| + TTT | pending | pending |
-| + all three (ours) | pending | pending |
+| + Value Residual | pending | pending |
+| + Gated Attention | pending | pending |
+| + AdamW TTT | pending | pending |
+| + all five (ours) | pending | pending |
 
 ## Status
 Code complete. Syntax OK. All smoke tests passing.

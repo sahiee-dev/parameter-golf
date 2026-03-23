@@ -539,6 +539,9 @@ class CausalSelfAttention(nn.Module):
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
+        # Gated Attention: learned scalar to scale full attention output per layer.
+        # init=1 means no change at step 0; model learns optimal per-layer attention scale.
+        self.attn_gate = nn.Parameter(torch.ones(1))
         self.use_xsa = False
 
     def _xsa_efficient(self, y: Tensor, v: Tensor) -> Tensor:
@@ -574,7 +577,10 @@ class CausalSelfAttention(nn.Module):
         if self.use_xsa:
             y = self._xsa_efficient(y, v)
         y = y.reshape(bsz, seqlen, dim)
-        return self.proj(y)
+        y = self.proj(y)
+        # Apply gated attention scalar after projection (init=1 = no-op at step 0)
+        y = self.attn_gate.to(dtype=y.dtype) * y
+        return y
 
 
 class MLP(nn.Module):
@@ -639,13 +645,20 @@ class Block(nn.Module):
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        # Value residual: scalar gate to blend initial token embedding into every layer.
+        # Initialised at 0 so it starts as a no-op and is learned during training.
+        self.lambda_v = nn.Parameter(torch.zeros(1))
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor, v0: Tensor | None = None) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        if v0 is not None:
+            # Add learned fraction of the raw input embedding — zero-init so training
+            # decides whether this shortcut is useful (matches PR #490 approach).
+            x = x + self.lambda_v.to(dtype=x.dtype) * v0
         return x
 
 
@@ -714,18 +727,18 @@ class GPT(nn.Module):
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
-            
+        v0 = x  # save raw embedding for value residual before any normalisation
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x0 = x
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self.blocks[i](x, x0, v0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x = self.blocks[self.num_encoder_layers + i](x, x0, v0)
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
@@ -741,18 +754,18 @@ class GPT(nn.Module):
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
-        
+        v0 = x  # save raw embedding for value residual
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x0 = x
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self.blocks[i](x, x0, v0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x = self.blocks[self.num_encoder_layers + i](x, x0, v0)
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -1250,7 +1263,7 @@ def main() -> None:
     # model adapts progressively, matching the token ordering of the sliding
     # evaluation that follows. Weights are restored after eval so TTT cannot
     # corrupt saved artifacts. Budget target: ≤50s on 8xH100.
-    def test_time_train(model, val_tokens, seq_len, device, ttt_lr=0.002,
+    def test_time_train(model, val_tokens, seq_len, device, ttt_lr=0.001,
                         ttt_epochs=3, freeze_layers=6):
         import copy
         original_state = copy.deepcopy(model.state_dict())
@@ -1260,10 +1273,11 @@ def main() -> None:
             for p in block.parameters():
                 p.requires_grad_(i >= freeze_layers)
 
-        optimizer = torch.optim.SGD(
+        # AdamW TTT: adaptive lr per-param, no cosine scheduling needed.
+        # Fixed lr=0.001 matches PR #490 which scored 1.0891.
+        optimizer = torch.optim.AdamW(
             [p for p in model.parameters() if p.requires_grad],
-            lr=ttt_lr,
-            momentum=0.9,
+            lr=ttt_lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0,
         )
 
         model.train()
@@ -1297,7 +1311,7 @@ def main() -> None:
     # No broadcast needed. This matches how SWA averaging targets identical state.
     original_state = test_time_train(
         base_model, val_tokens, args.train_seq_len, device,
-        ttt_lr=0.002, ttt_epochs=3, freeze_layers=6,
+        ttt_lr=0.001, ttt_epochs=3, freeze_layers=6,
     )
 
     # Sliding window eval on int6-roundtripped + TTT-adapted weights
