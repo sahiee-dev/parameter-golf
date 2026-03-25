@@ -986,8 +986,7 @@ def main() -> None:
 
     # EMA shadow model — exponential moving average of weights, zero artifact cost.
     # Decay=0.9999 tracks the full training trajectory; eval uses EMA weights.
-    import copy as _copy
-    ema_model = _copy.deepcopy(base_model)
+    ema_model = copy.deepcopy(base_model)
     ema_model.eval()
     for _p in ema_model.parameters():
         _p.requires_grad_(False)
@@ -1112,7 +1111,7 @@ def main() -> None:
     # MAIN TRAINING LOOP
     training_time_ms = 0.0
     stop_after_step: int | None = None
-    swa_state: dict[str, Tensor] | None = None
+    swa_model: dict[str, Tensor] | None = None
     swa_count = 0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
@@ -1184,13 +1183,13 @@ def main() -> None:
 
         # SWA: collect checkpoints during warmdown
         if args.swa_enabled and scale < args.swa_start_frac and step % args.swa_every == 0:
-            if swa_state is None:
-                swa_state = {name: t.detach().cpu().clone() for name, t in base_model.state_dict().items()}
+            if swa_model is None:
+                swa_model = {name: t.detach().cpu().clone() for name, t in base_model.state_dict().items()}
                 swa_count = 1
                 log0(f"swa:start step:{step}")
             else:
                 for name, t in base_model.state_dict().items():
-                    swa_state[name] += t.detach().cpu()
+                    swa_model[name] += t.detach().cpu()
                 swa_count += 1
 
         should_log_train = (
@@ -1217,12 +1216,12 @@ def main() -> None:
     )
 
     # Apply SWA if collected
-    if args.swa_enabled and swa_state is not None and swa_count > 1:
+    if args.swa_enabled and swa_model is not None and swa_count > 1:
         log0(f"swa:applying averaged {swa_count} checkpoints")
         current_state = base_model.state_dict()
         avg_state = {
             name: (tensor / swa_count).to(dtype=current_state[name].dtype)
-            for name, tensor in swa_state.items()
+            for name, tensor in swa_model.items()
         }
         base_model.load_state_dict(avg_state, strict=True)
 
@@ -1277,86 +1276,71 @@ def main() -> None:
     # Injects LoRA adapters into the last N layers. Runs AdamW on val tokens.
     # Restores original network topology and state afterward to ensure zero artifact overhead.
     def lora_ttt(model, val_tokens, seq_len, device, tokens_per_byte,
-                 lora_rank=8, lora_alpha=16.0,
-                 ttt_lr=0.001, ttt_epochs=3, layers_to_adapt=4, eot_id=2):
-        import copy
-        import math
-        original_state = copy.deepcopy(model.state_dict())
+                 lora_rank=8, lora_alpha=16.0, ttt_lr=0.001,
+                 layers_to_adapt=4, max_ttt_seconds=45):
+        import copy, math, time
 
-        # Split val_tokens into documents on endoftext token (Default eos=2)
-        boundaries = (val_tokens == eot_id).nonzero(as_tuple=True)[0].tolist()
-        boundaries = [0] + [b+1 for b in boundaries] + [len(val_tokens)]
-        documents = [val_tokens[boundaries[i]:boundaries[i+1]]
-                     for i in range(len(boundaries)-1)
-                     if boundaries[i+1] - boundaries[i] > seq_len]
+        # One-time LoRA injection — no per-document reset
+        lora_params = []
+        original_linears = {}
+        for i, block in enumerate(model.blocks):
+            if i >= len(model.blocks) - layers_to_adapt:
+                for name in ['c_q', 'c_k', 'c_v', 'proj']:
+                    base = getattr(block.attn, name)
+                    original_linears[(i, name)] = base
+                    lora = LoRALinear(base, rank=lora_rank, alpha=lora_alpha)
+                    setattr(block.attn, name, lora)
+                    lora_params.extend([lora.lora_A, lora.lora_B])
 
-        if not documents:
-            documents = [val_tokens]
+        for p in model.parameters():
+            p.requires_grad_(False)
+        for p in lora_params:
+            p.requires_grad_(True)
 
+        optimizer = torch.optim.AdamW(
+            lora_params, lr=ttt_lr, betas=(0.9, 0.999), weight_decay=0.0
+        )
+
+        model.eval()
         total_loss = 0.0
         total_tokens = 0
+        total_seqs = (val_tokens.numel() - 1) // seq_len
         ttt_t0 = time.perf_counter()
 
-        for doc_tokens in documents:
-            # Fresh LoRA injection for this document
-            lora_params = []
-            for i, block in enumerate(model.blocks):
-                if i >= len(model.blocks) - layers_to_adapt:
-                    for name in ['c_q', 'c_k', 'c_v', 'proj']:
-                        base = getattr(block.attn, name)
-                        lora = LoRALinear(base, rank=lora_rank, alpha=lora_alpha)
-                        setattr(block.attn, name, lora)
-                        lora_params.extend([lora.lora_A, lora.lora_B])
+        for idx in range(total_seqs):
+            # Hard time limit — stop TTT if taking too long
+            if time.perf_counter() - ttt_t0 > max_ttt_seconds:
+                log0(f'lora_ttt: time limit reached at seq {idx}/{total_seqs}')
+                break
 
-            for p in model.parameters():
-                p.requires_grad_(False)
-            for p in lora_params:
-                p.requires_grad_(True)
+            start = idx * seq_len
+            chunk = val_tokens[start: start + seq_len + 1].to(device)
+            x = chunk[:-1].unsqueeze(0).long()
+            y = chunk[1:].unsqueeze(0).long()
 
-            optimizer = torch.optim.AdamW(
-                lora_params, lr=ttt_lr, betas=(0.9, 0.999), weight_decay=0.0
-            )
+            # Score first (legal)
+            with torch.no_grad():
+                loss = model(x, y)
+                total_loss += loss.sum().item()
+                total_tokens += y.numel()
 
-            doc_seqs = (doc_tokens.numel() - 1) // seq_len
-            for epoch in range(ttt_epochs):
-                for idx in range(doc_seqs):
-                    start = idx * seq_len
-                    chunk = doc_tokens[start: start + seq_len + 1].to(device)
-                    x = chunk[:-1].unsqueeze(0).long()
-                    y = chunk[1:].unsqueeze(0).long()
-
-                    if epoch == ttt_epochs - 1:
-                        # Score on final epoch only (legal validation)
-                        model.eval()
-                        with torch.no_grad():
-                            loss = model(x, y)
-                            total_loss += loss.sum().item()
-                            total_tokens += y.numel()
-
-                    # Always adapt
-                    model.train()
-                    optimizer.zero_grad()
-                    adapt_loss = model(x, y)
-                    adapt_loss.mean().backward()
-                    optimizer.step()
-                    model.eval()
-
-            # Reset LoRA before next document
-            for i, block in enumerate(model.blocks):
-                if i >= len(model.blocks) - layers_to_adapt:
-                    for name in ['c_q', 'c_k', 'c_v', 'proj']:
-                        lora = getattr(block.attn, name)
-                        if isinstance(lora, LoRALinear):
-                            setattr(block.attn, name, lora.base)
-            model.load_state_dict(original_state)
+            # Adapt on already-scored tokens (legal)
+            model.train()
+            optimizer.zero_grad()
+            model(x, y).mean().backward()
+            optimizer.step()
+            model.eval()
 
         ttt_elapsed = time.perf_counter() - ttt_t0
         avg_loss = total_loss / max(total_tokens, 1)
         val_bpb = avg_loss / math.log(2) * tokens_per_byte
 
-        log0(f'lora_ttt_per_doc_complete rank:{lora_rank} epochs:{ttt_epochs} '
-             f'docs:{len(documents)} time:{ttt_elapsed*1000:.0f}ms '
-             f'val_bpb:{val_bpb:.4f}')
+        log0(f'lora_ttt_complete seqs:{total_seqs} '
+             f'time:{ttt_elapsed*1000:.0f}ms val_bpb:{val_bpb:.4f}')
+
+        # Restore original layers
+        for (i, name), base in original_linears.items():
+            setattr(model.blocks[i].attn, name, base)
 
         return avg_loss, val_bpb
 
