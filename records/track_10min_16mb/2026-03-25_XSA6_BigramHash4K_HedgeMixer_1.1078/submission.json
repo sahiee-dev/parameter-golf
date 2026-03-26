@@ -1,0 +1,27 @@
+{
+  "name": "XSA6 + BigramHash4K + GatedAttn + ValueResidual on Hedge Mixer Stack",
+  "author": "Shaik Ahamed Sahir",
+  "github_id": "sahiee-dev",
+  "val_bpb": 1.10699,
+  "val_bpb_std": 0.00046,
+  "seeds": {
+    "42": 1.10755,
+    "1337": 1.10698,
+    "2025": 1.10643
+  },
+  "base_pr": 720,
+  "changes": [
+    "Based on PR #720 (agalimova: XSA6 + BigramHash4K + HedgeMixer)",
+    "Gated Attention: added per-head FP32 scalar gate (attn_gate, init=1.0) to CausalSelfAttention",
+    "Value Residual: added per-block FP32 scalar (lambda_v, init=0.0) injecting initial embedding x0 into each Block output",
+    "Both attn_gate and lambda_v registered in CONTROL_TENSOR_NAME_PATTERNS (remains in FP32, not quantized by GPTQ)"
+  ],
+  "env": {
+    "torch": "2.9.0+cu126",
+    "gpu": "8xH100 SXM 80GB",
+    "flash_attn": "FA3 (Hopper, minimal build)",
+    "compression": "zstandard (zstd level 22)",
+    "artifact_size_bytes": 14917177
+  }
+}
+
