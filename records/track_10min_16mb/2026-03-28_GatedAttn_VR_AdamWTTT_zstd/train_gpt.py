@@ -11,17 +11,10 @@ import sys
 import time
 import uuid
 import zlib
-try:
-    import zstandard as zstd
-    _USE_ZSTD = True
-except ImportError:
-    _USE_ZSTD = False
+import zstandard as zstd
+_USE_ZSTD = True
 from pathlib import Path
-try:
-    import zstandard
-    _COMPRESSOR = "zstd"
-except ImportError:
-    _COMPRESSOR = "zlib"
+_COMPRESSOR = "zstd"
 import numpy as np
 import sentencepiece as spm
 import torch
@@ -83,7 +76,7 @@ class Hyperparameters:
     muon_wd = float(os.environ.get("MUON_WD", 0.04))
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
-    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 3072))
+    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2048))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
