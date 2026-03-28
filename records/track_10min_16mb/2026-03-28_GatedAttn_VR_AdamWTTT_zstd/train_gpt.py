@@ -65,7 +65,7 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
-    mtp_num_heads = int(os.environ.get("MTP_NUM_HEADS", 1))
+    mtp_num_heads = int(os.environ.get("MTP_NUM_HEADS", 0))
     mtp_loss_weight = float(os.environ.get("MTP_LOSS_WEIGHT", 0.2))
     muon_beta2 = float(os.environ.get("MUON_BETA2", 0.95))
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
@@ -78,7 +78,7 @@ class Hyperparameters:
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2048))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
-    xsa_last_n = int(os.environ.get("XSA_LAST_N", 11))
+    xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
     dtg_enabled = bool(int(os.environ.get("DTG_ENABLED", "0")))
@@ -90,7 +90,7 @@ class Hyperparameters:
     value_residual = bool(int(os.environ.get("VALUE_RESIDUAL", "1")))
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
     ttt_lr = float(os.environ.get("TTT_LR", 0.002))
-    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 2))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 5))
     ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32768))
     ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", 2))
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
@@ -1105,25 +1105,37 @@ def eval_val_sliding_ttt(
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
-    # Freeze first N blocks
-    frozen_block_ids = set(range(min(args.ttt_freeze_blocks, len(base_model.blocks))))
+    # qTTT: freeze ALL params, then unfreeze only Q projections (c_q)
+    # Backward pass 3x cheaper → allows 5 epochs in same eval budget
+    # Confirmed Q param name: blocks.{i}.attn.c_q.weight (from diagnostic)
+    for p in base_model.parameters():
+        p.requires_grad_(False)
+
     ttt_params = []
     for name, p in base_model.named_parameters():
-        freeze = False
-        for bi in frozen_block_ids:
-            if f"blocks.{bi}." in name:
-                freeze = True
-                break
-        if freeze:
-            p.requires_grad_(False)
-        else:
+        if "attn.c_q" in name:
             p.requires_grad_(True)
             ttt_params.append(p)
 
-    log0(f"ttt_sliding:params unfrozen={sum(p.numel() for p in ttt_params)} "
-         f"frozen={sum(p.numel() for p in base_model.parameters() if not p.requires_grad)}")
+    if len(ttt_params) == 0:
+        # Fallback: should never happen given diagnostic confirmed c_q exists
+        log0("WARNING: qTTT found no c_q params — falling back to all attn params")
+        for name, p in base_model.named_parameters():
+            if "attn" in name:
+                p.requires_grad_(True)
+                ttt_params.append(p)
 
-    optimizer = torch.optim.SGD(ttt_params, lr=args.ttt_lr, momentum=args.ttt_momentum, nesterov=True)
+    log0(f"qTTT:params q_only={sum(p.numel() for p in ttt_params)} "
+         f"total_frozen={sum(p.numel() for p in base_model.parameters() if not p.requires_grad)}")
+
+    # AdamW for Q-only adaptation — converges faster than SGD for partial params
+    optimizer = torch.optim.AdamW(
+        ttt_params,
+        lr=3e-4,
+        betas=(0.9, 0.95),
+        weight_decay=0.0,
+        fused=True,
+    )
     t0 = time.perf_counter()
 
     for ci in range(num_chunks):
