@@ -85,7 +85,7 @@ class Hyperparameters:
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 3072))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
-    xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
+    xsa_last_n = int(os.environ.get("XSA_LAST_N", 6))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
     dtg_enabled = bool(int(os.environ.get("DTG_ENABLED", "0")))
@@ -1130,9 +1130,7 @@ def eval_val_sliding_ttt(
     log0(f"ttt_sliding:params unfrozen={sum(p.numel() for p in ttt_params)} "
          f"frozen={sum(p.numel() for p in base_model.parameters() if not p.requires_grad)}")
 
-    optimizer = torch.optim.SGD(
-        ttt_params, lr=args.ttt_lr, momentum=args.ttt_momentum, nesterov=True
-    )
+    optimizer = torch.optim.SGD(ttt_params, lr=args.ttt_lr, momentum=args.ttt_momentum, nesterov=True)
     t0 = time.perf_counter()
 
     for ci in range(num_chunks):
