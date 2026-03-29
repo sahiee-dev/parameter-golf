@@ -46,7 +46,7 @@ class Hyperparameters:
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = float(os.environ.get("MLP_MULT", 2.7))
+    mlp_mult = float(os.environ.get("MLP_MULT", 2.85))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -90,7 +90,7 @@ class Hyperparameters:
     value_residual = bool(int(os.environ.get("VALUE_RESIDUAL", "1")))
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
     ttt_lr = float(os.environ.get("TTT_LR", 0.002))
-    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 5))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 2))
     ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32768))
     ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", 2))
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
@@ -1129,12 +1129,11 @@ def eval_val_sliding_ttt(
          f"total_frozen={sum(p.numel() for p in base_model.parameters() if not p.requires_grad)}")
 
     # AdamW for Q-only adaptation — converges faster than SGD for partial params
-    optimizer = torch.optim.AdamW(
+    optimizer = torch.optim.SGD(
         ttt_params,
-        lr=3e-4,
-        betas=(0.9, 0.95),
-        weight_decay=0.0,
-        fused=True,
+        lr=0.002,
+        momentum=0.9,
+        nesterov=True,
     )
     t0 = time.perf_counter()
 
