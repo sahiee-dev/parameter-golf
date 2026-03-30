@@ -1048,22 +1048,38 @@ def eval_val_sliding_slot(
     has_leading_space_lut: Tensor, is_boundary_token_lut: Tensor,
     stride: int, log0=print,
 ) -> tuple[float, float]:
-    """SLOT eval-time augmentation (score-first, per-document, no artifact cost).
-    For each sliding window (document): reset slot_vec to zero, score first, then
-    adapt slot_vec with AdamW for slot_steps steps on already-scored tokens."""
+    """SLOT eval-time augmentation (score-first, document-aware, no artifact cost).
+    slot_vec persists across windows within a document, resets only at BOS boundaries.
+    Documents are sharded across ranks; slot_vec is initialized once per document."""
     seq_len = args.train_seq_len
     total_tokens = val_tokens.numel() - 1
     model_dim = base_model.model_dim
 
-    window_starts = [ws for ws in range(0, total_tokens, stride)
-                     if min(ws + seq_len, total_tokens) - ws >= stride or ws == 0]
+    # Find document boundaries using BOS token (ID=1 for sentencepiece)
+    val_cpu = val_tokens[:total_tokens].cpu()
+    bos_positions = (val_cpu == 1).nonzero(as_tuple=True)[0].tolist()
+    doc_boundaries = sorted(set([0] + bos_positions + [total_tokens]))
+    num_docs = len(doc_boundaries) - 1  # doc i = tokens [doc_boundaries[i], doc_boundaries[i+1])
 
-    # Shard windows across ranks
-    my_s = (len(window_starts) * rank) // world_size
-    my_e = (len(window_starts) * (rank + 1)) // world_size
-    my_windows = window_starts[my_s:my_e]
+    # Build all window starts, assign each to its document
+    all_window_starts = [ws for ws in range(0, total_tokens, stride)
+                         if min(ws + seq_len, total_tokens) - ws >= stride or ws == 0]
+    doc_windows: list[list[int]] = [[] for _ in range(num_docs)]
+    bi = 0
+    for ws in all_window_starts:
+        while bi < num_docs - 1 and ws >= doc_boundaries[bi + 1]:
+            bi += 1
+        doc_windows[bi].append(ws)
 
-    log0(f"slot_eval:start total_windows={len(window_starts)} rank_windows={len(my_windows)} "
+    # Shard DOCUMENTS (not windows) across ranks — each document's windows must be
+    # processed sequentially by a single rank to carry slot_vec state forward.
+    my_doc_s = (num_docs * rank) // world_size
+    my_doc_e = (num_docs * (rank + 1)) // world_size
+    my_docs = list(range(my_doc_s, my_doc_e))
+    total_my_windows = sum(len(doc_windows[d]) for d in my_docs)
+
+    log0(f"slot_eval:start total_docs={num_docs} rank_docs={len(my_docs)} "
+         f"total_windows={len(all_window_starts)} rank_windows={total_my_windows} "
          f"stride={stride} slot_lr={args.slot_lr} slot_steps={args.slot_steps}")
 
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
@@ -1076,56 +1092,64 @@ def eval_val_sliding_slot(
 
     base_model.eval()
     t0 = time.perf_counter()
+    wi_global = 0
 
-    for wi, ws in enumerate(my_windows):
-        end = min(ws + seq_len, total_tokens)
-        wlen = end - ws
-        s = 0 if ws == 0 else max(wlen - stride, 0)  # new tokens scored this window
+    for doc_idx in my_docs:
+        windows = doc_windows[doc_idx]
+        if not windows:
+            continue
 
-        chunk_tok = val_tokens[ws:end + 1].to(dtype=torch.int64, device=device)
-        x_win = chunk_tok[:-1].unsqueeze(0)  # [1, wlen]
-        y_win = chunk_tok[1:].unsqueeze(0)   # [1, wlen]
+        # Initialize slot_vec ONCE per document — carries state across all windows in doc
+        slot_vec = torch.zeros(model_dim, device=device, dtype=torch.float32, requires_grad=True)
+        opt = torch.optim.AdamW([slot_vec], lr=args.slot_lr, betas=(0.9, 0.999),
+                                weight_decay=0.0, eps=1e-8)
 
-        # --- Phase 1: SCORE with current slot_vec = zero (reset per document) ---
-        slot_vec = torch.zeros(model_dim, device=device, dtype=torch.float32)
+        for ws in windows:
+            end = min(ws + seq_len, total_tokens)
+            wlen = end - ws
+            s = 0 if ws == 0 else max(wlen - stride, 0)  # new tokens scored this window
 
-        with torch.inference_mode():
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                logits = base_model.forward_logits_with_slot(x_win, slot_vec)
-            nll = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)).float(),
-                y_win.reshape(-1), reduction="none",
-            ).reshape(1, wlen)
-            scored_nll = nll[0, s:wlen].to(torch.float64)
-            loss_sum += scored_nll.sum()
-            token_count += float(wlen - s)
-            tgt = y_win[0, s:wlen]
-            prev = x_win[0, s:wlen]
-            tb = base_bytes_lut[tgt].to(torch.float64)
-            tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
-            byte_count += tb.sum()
+            chunk_tok = val_tokens[ws:end + 1].to(dtype=torch.int64, device=device)
+            x_win = chunk_tok[:-1].unsqueeze(0)  # [1, wlen]
+            y_win = chunk_tok[1:].unsqueeze(0)   # [1, wlen]
 
-        # --- Phase 2: ADAPT slot_vec on already-scored tokens (legal) ---
-        if args.slot_steps > 0 and wlen > 0:
-            slot_vec = torch.zeros(model_dim, device=device, dtype=torch.float32, requires_grad=True)
-            opt = torch.optim.AdamW([slot_vec], lr=args.slot_lr, betas=(0.9, 0.999),
-                                    weight_decay=0.0, eps=1e-8)
-            for _ in range(args.slot_steps):
-                opt.zero_grad()
+            # --- Phase 1: SCORE with current slot_vec (persists from prev window in doc) ---
+            sv_score = slot_vec.detach()
+            with torch.inference_mode():
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    logits_adapt = base_model.forward_logits_with_slot(x_win, slot_vec)
-                adapt_loss = F.cross_entropy(
-                    logits_adapt.reshape(-1, logits_adapt.size(-1)).float(),
-                    y_win.reshape(-1), reduction="mean",
-                )
-                adapt_loss.backward()
-                opt.step()
+                    logits = base_model.forward_logits_with_slot(x_win, sv_score)
+                nll = F.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)).float(),
+                    y_win.reshape(-1), reduction="none",
+                ).reshape(1, wlen)
+                scored_nll = nll[0, s:wlen].to(torch.float64)
+                loss_sum += scored_nll.sum()
+                token_count += float(wlen - s)
+                tgt = y_win[0, s:wlen]
+                prev = x_win[0, s:wlen]
+                tb = base_bytes_lut[tgt].to(torch.float64)
+                tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
+                byte_count += tb.sum()
 
-        if rank == 0 and (wi % 500 == 0 or wi == len(my_windows) - 1):
-            elapsed = time.perf_counter() - t0
-            rl = loss_sum.item() / max(token_count.item(), 1)
-            rbpb = rl / math.log(2.0) * (token_count.item() / max(byte_count.item(), 1)) if token_count.item() > 0 else 0.0
-            log0(f"  slot_window [{wi+1}/{len(my_windows)}] bpb={rbpb:.6f} time={elapsed:.1f}s")
+            # --- Phase 2: ADAPT slot_vec on already-scored tokens (legal) ---
+            if args.slot_steps > 0 and wlen > 0:
+                for _ in range(args.slot_steps):
+                    opt.zero_grad()
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        logits_adapt = base_model.forward_logits_with_slot(x_win, slot_vec)
+                    adapt_loss = F.cross_entropy(
+                        logits_adapt.reshape(-1, logits_adapt.size(-1)).float(),
+                        y_win.reshape(-1), reduction="mean",
+                    )
+                    adapt_loss.backward()
+                    opt.step()
+
+            wi_global += 1
+            if rank == 0 and wi_global % 500 == 0:
+                elapsed = time.perf_counter() - t0
+                rl = loss_sum.item() / max(token_count.item(), 1)
+                rbpb = rl / math.log(2.0) * (token_count.item() / max(byte_count.item(), 1)) if token_count.item() > 0 else 0.0
+                log0(f"  slot_window [{wi_global}/{total_my_windows}] bpb={rbpb:.6f} time={elapsed:.1f}s")
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
@@ -1142,6 +1166,7 @@ def eval_val_sliding_slot(
     log0(f"slot_eval:done val_loss={val_loss:.6f} val_bpb={val_bpb:.6f} "
          f"elapsed={time.perf_counter() - t0:.1f}s")
     return val_loss, val_bpb
+
 
 # --- Sliding window evaluation ---
 
