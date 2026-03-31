@@ -1079,7 +1079,7 @@ def eval_val_sliding(
     use_slot = getattr(args, 'slot_enabled', False)
     base_model.eval()
     compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
-    compiled_hidden = torch.compile(base_model.forward_hidden, dynamic=False, fullgraph=True) if use_slot else None
+    compiled_hidden = base_model.forward_hidden if use_slot else None
     ctx = torch.no_grad() if use_slot else torch.inference_mode()
     with ctx:
         for bi in range(0, len(my_windows), batch_seqs):
