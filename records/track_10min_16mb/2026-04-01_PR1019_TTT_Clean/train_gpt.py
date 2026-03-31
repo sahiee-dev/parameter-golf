@@ -2228,6 +2228,9 @@ def main() -> None:
     deq_unbanked = dequantize_mixed_int6(quant_state["w"], quant_state["m"], unbanked_sd)
     # Re-bank the dequantized tensors
     deq_state = _rebank_state_dict(deq_unbanked, args.num_layers, sd_cpu)
+    del compiled_model
+    del base_model
+    torch.cuda.empty_cache()
     eval_model = GPT(
         vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
         num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
@@ -2263,6 +2266,8 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int6_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    del compiled_eval
+    torch.cuda.empty_cache()
     sw_seq_len = effective_eval_seq_len
     if args.eval_stride > 0 and args.eval_stride < sw_seq_len:
         torch.cuda.synchronize()
