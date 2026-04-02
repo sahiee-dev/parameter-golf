@@ -51,7 +51,9 @@ class Hyperparameters:
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
     use_p2_loss = bool(int(os.environ.get("USE_P2_LOSS", "1")))
-    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    logit_sharpen = float(os.environ.get("LOGIT_SHARPEN", "1.10"))
+    use_qk_gain = bool(int(os.environ.get("USE_QK_GAIN", "1")))
+    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", "4.0"))
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 11))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
@@ -369,7 +371,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,dtg_gate,ve_layer_scales,ve_shared.scale,attn_gate,vr_lambda",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,dtg_gate,ve_layer_scales,ve_shared.scale,attn_gate,vr_lambda,qk_gain",
     ).split(",")
     if pattern
 )
@@ -636,6 +638,10 @@ class CausalSelfAttention(nn.Module):
             self.attn_gate = nn.Linear(dim, num_heads, bias=True)
             nn.init.zeros_(self.attn_gate.weight)
             nn.init.constant_(self.attn_gate.bias, 4.0)
+        if Hyperparameters.use_qk_gain:
+            self.qk_gain = nn.Parameter(
+                torch.full((1,), Hyperparameters.qk_gain_init, dtype=torch.float32)
+            )
         self.value_residual = value_residual
         if value_residual:
             self.vrl_alpha = nn.Parameter(torch.zeros(1, dtype=torch.float32))  # sigmoid gate (PR #569 style)
@@ -667,6 +673,8 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin, self.rope_dims)
         k = apply_rotary_emb(k, cos, sin, self.rope_dims)
         q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
+        if Hyperparameters.use_qk_gain:
+            q = q * self.qk_gain.to(q.dtype)
         y = flash_attn_3_func(q, k, v, causal=True)
         if self.use_xsa:
             y = self._xsa_efficient(y, v)
@@ -960,7 +968,7 @@ class GPT(nn.Module):
             logits_proj = self.lm_head(x_flat)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         if Hyperparameters.use_p2_loss:
-            log_probs = F.log_softmax(logits.float(), dim=-1)
+            log_probs = F.log_softmax(logits.float() * Hyperparameters.logit_sharpen, dim=-1)
             target_logp = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
             p = target_logp.exp().clamp(max=1.0)
             weights = ((1.0 - p) ** 2).detach()
