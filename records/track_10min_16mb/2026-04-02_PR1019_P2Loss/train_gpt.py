@@ -53,7 +53,7 @@ class Hyperparameters:
     use_p2_loss = bool(int(os.environ.get("USE_P2_LOSS", "1")))
     logit_sharpen = float(os.environ.get("LOGIT_SHARPEN", "1.10"))
     use_qk_gain = bool(int(os.environ.get("USE_QK_GAIN", "1")))
-    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", "4.0"))
+    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", "1.0"))
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 11))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
