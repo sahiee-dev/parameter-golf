@@ -1458,7 +1458,7 @@ class Muon(torch.optim.Optimizer):
                 if row_normalize:
                     rn = update.float().norm(dim=-1, keepdim=True).clamp_min(1e-08)
                     update = update / rn.to(update.dtype)
-                    cn = update.float().norm(dim=0, keepdim=True).clamp_min(1e-08)
+                    cn = update.float().norm(dim=-2, keepdim=True).clamp_min(1e-08)
                     update = update / cn.to(update.dtype)
                 update = zeropower_via_newtonschulz5(update, steps=backend_steps)
                 if sharded:
