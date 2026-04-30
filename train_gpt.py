@@ -1420,9 +1420,26 @@ class Muon(torch.optim.Optimizer):
                     prev_ag_handle.wait()
                     pp = prev_m["p"]
                     upd = prev_m["full_update"][: prev_m["B"]]
+                    
+                    # Split-LR implementation: early=0.025, late=0.030
+                    split_lr = lr
+                    if pp.ndim == 3 and (pp.shape[0] == 12 or pp.shape[0] == 24):
+                        B_dim = pp.shape[0]
+                        split_lr = torch.full((B_dim, 1, 1), 0.030, device=pp.device, dtype=pp.dtype)
+                        split_lr[:6] = 0.025
+                        if B_dim == 24:
+                            split_lr[12:18] = 0.025
+                            
                     if wd > 0.0:
-                        pp.data.mul_(1.0 - lr * wd)
-                    pp.add_(upd.to(dtype=pp.dtype), alpha=-lr * prev_m["scale"])
+                        if isinstance(split_lr, torch.Tensor):
+                            pp.data.mul_(1.0 - split_lr * wd)
+                        else:
+                            pp.data.mul_(1.0 - lr * wd)
+                            
+                    if isinstance(split_lr, torch.Tensor):
+                        pp.add_(upd.to(dtype=pp.dtype) * split_lr, alpha=-prev_m["scale"])
+                    else:
+                        pp.add_(upd.to(dtype=pp.dtype), alpha=-lr * prev_m["scale"])
                 if sharded and self._rs_futures[idx] is not None:
                     self._rs_futures[idx].wait()
                     g = m["shard"]
