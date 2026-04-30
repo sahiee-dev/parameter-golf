@@ -750,7 +750,7 @@ class Block(nn.Module):
                 attn_in, q_w, k_w, v_w, out_w, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
             )
             mlp_out = self.mlp_scale.to(dtype=x_in.dtype)[None, None, :] * self.mlp(
-                attn_in, up_w, down_w
+                self.mlp_norm(x_in) * self.ln_scale_factor, up_w, down_w
             )
             x_out = x_in + attn_out + mlp_out
         else:
@@ -1456,9 +1456,9 @@ class Muon(torch.optim.Optimizer):
                 else:
                     update = buf
                 if row_normalize:
-                    rn = update.float().norm(dim=-1, keepdim=True).clamp_min(1e-08)
+                    rn = update.float().norm(dim=-1, keepdim=True).clamp_min(1e-07)
                     update = update / rn.to(update.dtype)
-                    cn = update.float().norm(dim=-2, keepdim=True).clamp_min(1e-08)
+                    cn = update.float().norm(dim=-2, keepdim=True).clamp_min(1e-07)
                     update = update / cn.to(update.dtype)
                 update = zeropower_via_newtonschulz5(update, steps=backend_steps)
                 if sharded:
@@ -2609,7 +2609,7 @@ def eval_val_ttt_phased(h, base_model, device, val_data, forward_ttt_train):
             x = torch.where(valid, gathered_gpu[:, :context_size], 0)
             y = torch.where(valid, gathered_gpu[:, 1 : context_size + 1], 0)
             ctx_pos = torch.arange(context_size, device=device, dtype=torch.int64)
-            with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 eval_loss = forward_ttt_train(x, y, lora=cur_lora)
             _accumulate_bpb(
                 eval_loss,
