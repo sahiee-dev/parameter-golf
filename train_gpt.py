@@ -456,24 +456,9 @@ class RMSNorm(nn.Module):
 
 class CastedLinear(nn.Linear):
     def forward(self, x):
-        global current_step
-        if current_step < 0 or self.weight.ndim < 2:
-            w = self.weight.to(x.dtype)
-            bias = self.bias.to(x.dtype) if self.bias is not None else None
-            return F.linear(x, w, bias)
-            
-        w = self.weight.float()
-        clip_abs = torch.quantile(w.abs(), 0.9999984, dim=1).clamp_min(1e-8)
-        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
-        
-        w_scaled = w / scale[:, None]
-        alpha = 1.0 + 15.0 * min(max(current_step, 0) / 500.0, 1.0)
-        frac = w_scaled - w_scaled.detach().floor()
-        w_q = w_scaled.detach().floor() + torch.sigmoid(alpha * (frac - 0.5))
-        
-        w_restored = w_q * scale[:, None]
+        w = self.weight.to(x.dtype)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, w_restored.to(x.dtype), bias)
+        return F.linear(x, w, bias)
 
 
 @triton.jit
